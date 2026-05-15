@@ -96,6 +96,7 @@ export class AionrsManager extends BaseAgentManager<AionrsManagerData, string> {
   private heartbeatActive = false;
 
   // Thinking state
+  private isInsideThinkBlock: boolean = false;
   private thinkingMsgId: string | null = null;
   private thinkingStartTime: number | null = null;
   private thinkingContent: string = '';
@@ -561,6 +562,8 @@ export class AionrsManager extends BaseAgentManager<AionrsManagerData, string> {
         this.heartbeatMissedCount = 0;
         this.currentMsgId = data.msg_id ?? null;
         this.currentMsgContent = '';
+        const modelId = this.model?.useModel || '';
+        this.isInsideThinkBlock = /qwen3|minimax|reasoning|think|deepseek-r1|r1/i.test(modelId);
 
         // Reset thinking state on new turn
         if (this.thinkingMsgId) {
@@ -594,8 +597,8 @@ export class AionrsManager extends BaseAgentManager<AionrsManagerData, string> {
         return;
       }
 
-      // Non-thought event while thinking → end thinking phase
-      if (this.thinkingMsgId) {
+      // Non-thought, non-content event while thinking → end thinking phase
+      if (this.thinkingMsgId && data.type !== 'content') {
         this.emitThinkingMessage('', 'done');
         this.clearThinkingState();
       }
@@ -603,13 +606,46 @@ export class AionrsManager extends BaseAgentManager<AionrsManagerData, string> {
       // Extract inline <think> tags from content before main pipeline
       let processedData = data;
       if (data.type === 'content' && typeof data.data === 'string') {
-        const { thinking, content: stripped } = extractAndStripThinkTags(data.data);
-        if (thinking) {
-          this.emitThinkingMessage(thinking, 'thinking');
+        let chunk = data.data;
+        let normalContent = '';
+
+        while (chunk.length > 0) {
+          if (!this.isInsideThinkBlock) {
+            const openMatch = chunk.match(/<\s*think(?:ing)?\s*>/i);
+            if (openMatch) {
+              const index = chunk.indexOf(openMatch[0]);
+              normalContent += chunk.substring(0, index);
+              chunk = chunk.substring(index + openMatch[0].length);
+              this.isInsideThinkBlock = true;
+            } else {
+              normalContent += chunk;
+              break;
+            }
+          } else {
+            const closeMatch = chunk.match(/<\s*\/\s*think(?:ing)?\s*>/i);
+            if (closeMatch) {
+              const index = chunk.indexOf(closeMatch[0]);
+              const thinkContent = chunk.substring(0, index);
+              if (thinkContent) {
+                this.emitThinkingMessage(thinkContent, 'thinking');
+              }
+              this.emitThinkingMessage('', 'done');
+              this.clearThinkingState();
+              chunk = chunk.substring(index + closeMatch[0].length);
+              this.isInsideThinkBlock = false;
+            } else {
+              if (chunk) {
+                this.emitThinkingMessage(chunk, 'thinking');
+              }
+              break;
+            }
+          }
         }
-        if (stripped !== data.data) {
-          processedData = { ...data, data: stripped };
+
+        if (!normalContent) {
+          return; // Skip emitting content message if it's entirely consumed by thinking
         }
+        processedData = { ...data, data: normalContent };
       }
 
       // Accumulate text content from incremental deltas
