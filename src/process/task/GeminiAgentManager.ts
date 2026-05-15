@@ -121,6 +121,7 @@ export class GeminiAgentManager extends BaseAgentManager<
   private thinkingContent: string = '';
   private thinkingDbFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly thinkingDbFlushIntervalMs = 120;
+  private isInsideThinkBlock: boolean = false;
 
   /** Stored webSearchEngine for worker re-bootstrap / 保存 webSearchEngine 用于重建 worker */
   private webSearchEngine?: 'google' | 'default';
@@ -789,6 +790,17 @@ export class GeminiAgentManager extends BaseAgentManager<
       }
       if (data.type === 'start') {
         this.status = 'running';
+        const modelId = this.model?.useModel || '';
+        this.isInsideThinkBlock = /qwen3|minimax|reasoning|think|deepseek-r1|r1/i.test(modelId);
+        
+        // Reset thinking state on new turn
+        if (this.thinkingMsgId) {
+          this.emitThinkingMessage('', 'done');
+          this.thinkingMsgId = null;
+          this.thinkingStartTime = null;
+          this.thinkingContent = '';
+        }
+
         const traceData = {
           agentType: 'gemini' as const,
           provider: this.model.name,
@@ -822,8 +834,8 @@ export class GeminiAgentManager extends BaseAgentManager<
         if (content) {
           this.emitThinkingMessage(content, 'thinking');
         }
-      } else if (this.thinkingMsgId) {
-        // Any non-thought message means thinking phase is over
+      } else if (this.thinkingMsgId && data.type !== 'content') {
+        // Any non-thought, non-content message means thinking phase is over
         this.emitThinkingMessage('', 'done');
         this.thinkingMsgId = null;
         this.thinkingStartTime = null;
@@ -843,20 +855,55 @@ export class GeminiAgentManager extends BaseAgentManager<
         }
       }
 
-      // Strip inline <think> tags from content messages to prevent leaking
-      // internal reasoning to the UI (e.g. models that embed think tags in content)
+      // Extract inline <think> tags from content before main pipeline
+      let processedData = data;
       if (data.type === 'content' && typeof data.data === 'string') {
-        const { thinking, content: stripped } = extractAndStripThinkTags(data.data);
-        if (thinking) {
-          this.emitThinkingMessage(thinking, 'thinking');
+        let chunk = data.data;
+        let normalContent = '';
+
+        while (chunk.length > 0) {
+          if (!this.isInsideThinkBlock) {
+            const openMatch = chunk.match(/<\s*think(?:ing)?\s*>/i);
+            if (openMatch) {
+              const index = chunk.indexOf(openMatch[0]);
+              normalContent += chunk.substring(0, index);
+              chunk = chunk.substring(index + openMatch[0].length);
+              this.isInsideThinkBlock = true;
+            } else {
+              normalContent += chunk;
+              break;
+            }
+          } else {
+            const closeMatch = chunk.match(/<\s*\/\s*think(?:ing)?\s*>/i);
+            if (closeMatch) {
+              const index = chunk.indexOf(closeMatch[0]);
+              const thinkContent = chunk.substring(0, index);
+              if (thinkContent) {
+                this.emitThinkingMessage(thinkContent, 'thinking');
+              }
+              this.emitThinkingMessage('', 'done');
+              this.thinkingMsgId = null;
+              this.thinkingStartTime = null;
+              this.thinkingContent = '';
+              chunk = chunk.substring(index + closeMatch[0].length);
+              this.isInsideThinkBlock = false;
+            } else {
+              if (chunk) {
+                this.emitThinkingMessage(chunk, 'thinking');
+              }
+              break;
+            }
+          }
         }
-        if (stripped !== data.data) {
-          data = { ...data, data: stripped };
+
+        if (!normalContent) {
+          return; // Skip emitting content message if it's entirely consumed by thinking
         }
+        processedData = { ...data, data: normalContent };
       }
 
       // Filter think tags from streaming content before emitting to UI
-      const filteredData = this.filterThinkTagsFromMessage(data);
+      const filteredData = this.filterThinkTagsFromMessage(processedData);
       ipcBridge.geminiConversation.responseStream.emit(filteredData);
 
       // Emit terminal events to main-process-local bus so TeammateManager can
