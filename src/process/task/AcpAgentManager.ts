@@ -97,6 +97,7 @@ class AcpAgentManager extends BaseAgentManager<AcpAgentManagerData, AcpPermissio
   // Track current message for cron detection (accumulated from streaming chunks)
   private currentMsgId: string | null = null;
   private currentMsgContent: string = '';
+  private isInsideThinkBlock: boolean = false;
   /** Current turn's thinking message msg_id for accumulating content */
   private thinkingMsgId: string | null = null;
   /** Timestamp when thinking started for duration calculation */
@@ -656,6 +657,8 @@ ${collectedResponses.join('\n')}`;
     // Emit request trace on each model generation start
     if (message.type === 'start') {
       const modelInfo = this.agent?.getModelInfo();
+      const modelId = modelInfo?.currentModelId || this.persistedModelId || 'unknown';
+      this.isInsideThinkBlock = /qwen3|minimax|reasoning|think|deepseek-r1|r1/i.test(modelId);
       ipcBridge.acpConversation.responseStream.emit({
         type: 'request_trace',
         conversation_id: this.conversation_id,
@@ -691,8 +694,8 @@ ${collectedResponses.join('\n')}`;
       if (content) {
         this.emitThinkingMessage(content, 'thinking');
       }
-    } else if (this.thinkingMsgId) {
-      // Any non-thought message means thinking phase is over
+    } else if (this.thinkingMsgId && message.type !== 'content') {
+      // Any non-thought, non-content message means thinking phase is over
       this.emitThinkingMessage('', 'done');
       this.thinkingMsgId = null;
       this.thinkingStartTime = null;
@@ -704,13 +707,48 @@ ${collectedResponses.join('\n')}`;
     // (e.g. MiniMax models embed think tags in content)
     let processedMessage = message;
     if (message.type === 'content' && typeof message.data === 'string') {
-      const { thinking, content: stripped } = extractAndStripThinkTags(message.data);
-      if (thinking) {
-        this.emitThinkingMessage(thinking, 'thinking');
+      let chunk = message.data;
+      let normalContent = '';
+
+      while (chunk.length > 0) {
+        if (!this.isInsideThinkBlock) {
+          const openMatch = chunk.match(/<\s*think(?:ing)?\s*>/i);
+          if (openMatch) {
+            const index = chunk.indexOf(openMatch[0]);
+            normalContent += chunk.substring(0, index);
+            chunk = chunk.substring(index + openMatch[0].length);
+            this.isInsideThinkBlock = true;
+          } else {
+            normalContent += chunk;
+            break;
+          }
+        } else {
+          const closeMatch = chunk.match(/<\s*\/\s*think(?:ing)?\s*>/i);
+          if (closeMatch) {
+            const index = chunk.indexOf(closeMatch[0]);
+            const thinkContent = chunk.substring(0, index);
+            if (thinkContent) {
+              this.emitThinkingMessage(thinkContent, 'thinking');
+            }
+            this.emitThinkingMessage('', 'done');
+            this.thinkingMsgId = null;
+            this.thinkingStartTime = null;
+            this.thinkingContent = '';
+            chunk = chunk.substring(index + closeMatch[0].length);
+            this.isInsideThinkBlock = false;
+          } else {
+            if (chunk) {
+              this.emitThinkingMessage(chunk, 'thinking');
+            }
+            break;
+          }
+        }
       }
-      if (stripped !== message.data) {
-        processedMessage = { ...message, data: stripped };
+
+      if (!normalContent) {
+        return; // Skip emitting content message if it's entirely consumed by thinking
       }
+      processedMessage = { ...message, data: normalContent };
     }
 
     if (
